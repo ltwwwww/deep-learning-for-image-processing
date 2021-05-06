@@ -1,7 +1,7 @@
 """
 本脚本有两个功能：
 1.将voc数据集标注信息(.xml)转为yolo标注格式(.txt)，并将图像文件复制到相应文件夹
-2.根据json标签文件，生成对应txt标签(my_class.txt)
+2.根据json标签文件，生成对应names标签(my_data_label.names)
 """
 import os
 from tqdm import tqdm
@@ -11,7 +11,7 @@ import shutil
 
 
 # voc数据集根目录以及版本
-voc_root = "~/VOCdevkit"
+voc_root = "/data/VOCdevkit"
 voc_version = "VOC2012"
 
 # 转换的训练集以及验证集对应txt文件
@@ -19,7 +19,7 @@ train_txt = "train.txt"
 val_txt = "val.txt"
 
 # 转换后的文件保存目录
-save_file_root = "~/my_project/my_yolo_dataset"
+save_file_root = "./my_yolo_dataset"
 
 # label标签对应json文件
 label_json_path = './data/pascal_voc_classes.json'
@@ -35,8 +35,9 @@ assert os.path.exists(voc_images_path), "VOC images path not exist..."
 assert os.path.exists(voc_xml_path), "VOC xml path not exist..."
 assert os.path.exists(train_txt_path), "VOC train txt file not exist..."
 assert os.path.exists(val_txt_path), "VOC val txt file not exist..."
-assert os.path.exists(save_file_root), "path saving yolo annotation not exist..."
 assert os.path.exists(label_json_path), "label_json_path does not exist..."
+if os.path.exists(save_file_root) is False:
+    os.makedirs(save_file_root)
 
 
 def parse_xml_to_dict(xml):
@@ -99,6 +100,7 @@ def translate_info(file_names: list, save_root: str, class_dict: dict, train_val
 
         # write object info into txt
         with open(os.path.join(save_txt_path, file + ".txt"), "w") as f:
+            assert "object" in data.keys(), "file: '{}' lack of object key.".format(xml_path)
             for index, obj in enumerate(data["object"]):
                 # 获取每个object的box信息
                 xmin = float(obj["bndbox"]["xmin"])
@@ -128,12 +130,12 @@ def translate_info(file_names: list, save_root: str, class_dict: dict, train_val
                     f.write("\n" + " ".join(info))
 
         # copy image into save_images_path
-        shutil.copyfile(img_path, os.path.join(save_images_path, img_path.split("/")[-1]))
+        shutil.copyfile(img_path, os.path.join(save_images_path, img_path.split(os.sep)[-1]))
 
 
-def create_class_txt(class_dict: dict):
+def create_class_names(class_dict: dict):
     keys = class_dict.keys()
-    with open("./data/my_class.txt", "w") as w:
+    with open("./data/my_data_label.names", "w") as w:
         for index, k in enumerate(keys):
             if index + 1 == len(keys):
                 w.write(k)
@@ -158,8 +160,8 @@ def main():
     # voc信息转yolo，并将图像文件复制到相应文件夹
     translate_info(val_file_names, save_file_root, class_dict, "val")
 
-    # 创建my_class.txt文件
-    create_class_txt(class_dict)
+    # 创建my_data_label.names文件
+    create_class_names(class_dict)
 
 
 if __name__ == "__main__":

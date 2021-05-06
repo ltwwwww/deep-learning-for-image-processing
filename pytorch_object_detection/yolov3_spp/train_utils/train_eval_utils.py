@@ -1,15 +1,16 @@
 import sys
 
+from torch.cuda import amp
 import torch.nn.functional as F
 
-from utils.utils import *
-from train_utils.coco_eval import CocoEvaluator
-from train_utils.coco_utils import get_coco_api_from_dataset
+from build_utils.utils import *
+from .coco_eval import CocoEvaluator
+from .coco_utils import get_coco_api_from_dataset
 import train_utils.distributed_utils as utils
 
 
 def train_one_epoch(model, optimizer, data_loader, device, epoch,
-                    print_freq, accumulate, img_size, batch_size,
+                    print_freq, accumulate, img_size,
                     grid_min, grid_max, gs,
                     multi_scale=False, warmup=False):
     model.train()
@@ -19,12 +20,15 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
 
     lr_scheduler = None
     if epoch == 0 and warmup is True:  # 当训练第一轮（epoch=0）时，启用warmup训练方式，可理解为热身训练
-        warmup_factor = 5.0 / 1000
+        warmup_factor = 1.0 / 1000
         warmup_iters = min(1000, len(data_loader) - 1)
 
         lr_scheduler = utils.warmup_lr_scheduler(optimizer, warmup_iters, warmup_factor)
+        accumulate = 1
 
     enable_amp = True if "cuda" in device.type else False
+    scaler = amp.GradScaler(enabled=enable_amp)
+
     mloss = torch.zeros(4).to(device)  # mean losses
     now_lr = 0.
     nb = len(data_loader)  # number of batches
@@ -41,7 +45,7 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
         if multi_scale:
             # 每训练64张图片，就随机修改一次输入图片大小，
             # 由于label已转为相对坐标，故缩放图片不影响label的值
-            if ni % accumulate == 0:  #  adjust img_size (67% - 150%) every 1 batch
+            if ni % accumulate == 0:  # adjust img_size (67% - 150%) every 1 batch
                 # 在给定最大最小输入尺寸范围内随机选取一个size(size为32的整数倍)
                 img_size = random.randrange(grid_min, grid_max + 1) * gs
             sf = img_size / max(imgs.shape[2:])  # scale factor
@@ -53,7 +57,7 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
                 imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
         # 混合精度训练上下文管理器，如果在CPU环境中不起任何作用
-        with torch.cuda.amp.autocast(enabled=enable_amp):
+        with amp.autocast(enabled=enable_amp):
             pred = model(imgs)
 
             # loss
@@ -70,26 +74,27 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch,
                                     losses_reduced)).detach()
             mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
 
-            loss_value = losses_reduced.item()
             if not torch.isfinite(losses_reduced):
-                print('WARNING: non-finite loss, ending training ', loss_value)
+                print('WARNING: non-finite loss, ending training ', loss_dict_reduced)
                 print("training image path: {}".format(",".join(paths)))
                 sys.exit(1)
 
-        # 每训练64张图片更新一次权重
+            losses *= 1. / accumulate  # scale loss
+
         # backward
-        losses *= batch_size / 64  # scale loss
-        losses.backward()
+        scaler.scale(losses).backward()
         # optimize
+        # 每训练64张图片更新一次权重
         if ni % accumulate == 0:
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
 
         metric_logger.update(loss=losses_reduced, **loss_dict_reduced)
         now_lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=now_lr)
 
-        if lr_scheduler is not None:  # 第一轮使用warmup训练方式
+        if ni % accumulate == 0 and lr_scheduler is not None:  # 第一轮使用warmup训练方式
             lr_scheduler.step()
 
     return mloss, now_lr
@@ -110,7 +115,7 @@ def evaluate(model, data_loader, coco=None, device=None):
     iou_types = _get_iou_types(model)
     coco_evaluator = CocoEvaluator(coco, iou_types)
 
-    for imgs, targets, paths, _, img_index in metric_logger.log_every(data_loader, 100, header):
+    for imgs, targets, paths, shapes, img_index in metric_logger.log_every(data_loader, 100, header):
         imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
         # targets = targets.to(device)
 
@@ -120,7 +125,9 @@ def evaluate(model, data_loader, coco=None, device=None):
 
         model_time = time.time()
         pred = model(imgs)[0]  # only get inference result
-        pred = non_max_suppression(pred, conf_thres=0.001, iou_thres=0.6, multi_label=False)
+        pred = non_max_suppression(pred, conf_thres=0.01, iou_thres=0.6, multi_label=False)
+        model_time = time.time() - model_time
+
         outputs = []
         for index, p in enumerate(pred):
             if p is None:
@@ -129,13 +136,15 @@ def evaluate(model, data_loader, coco=None, device=None):
             else:
                 # xmin, ymin, xmax, ymax
                 boxes = p[:, :4]
+                # shapes: (h0, w0), ((h / h0, w / w0), pad)
+                # 将boxes信息还原回原图尺度，这样计算的mAP才是准确的
+                boxes = scale_coords(imgs[index].shape[1:], boxes, shapes[index][0]).round()
 
             # 注意这里传入的boxes格式必须是xmin, ymin, xmax, ymax，且为绝对坐标
             info = {"boxes": boxes.to(cpu_device),
                     "labels": p[:, 5].to(device=cpu_device, dtype=torch.int64),
                     "scores": p[:, 4].to(cpu_device)}
             outputs.append(info)
-        model_time = time.time() - model_time
 
         res = {img_id: output for img_id, output in zip(img_index, outputs)}
 
@@ -154,7 +163,7 @@ def evaluate(model, data_loader, coco=None, device=None):
     coco_evaluator.summarize()
     torch.set_num_threads(n_threads)
 
-    result_info = coco_evaluator.coco_eval[iou_types[0]].stats
+    result_info = coco_evaluator.coco_eval[iou_types[0]].stats.tolist()  # numpy to list
 
     return result_info
 

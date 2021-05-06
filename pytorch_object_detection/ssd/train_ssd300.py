@@ -1,12 +1,13 @@
 import os
+import datetime
 
 import torch
 
-import transform
+import transforms
 from my_dataset import VOC2012DataSet
-from src.ssd_model import SSD300, Backbone
+from src import SSD300, Backbone
 import train_utils.train_eval_utils as utils
-from train_utils.coco_utils import get_coco_api_from_dataset
+from train_utils import get_coco_api_from_dataset
 
 
 def create_model(num_classes=21, device=torch.device('cpu')):
@@ -17,6 +18,8 @@ def create_model(num_classes=21, device=torch.device('cpu')):
 
     # https://ngc.nvidia.com/catalog/models -> search ssd -> download FP32
     pre_ssd_path = "./src/nvidia_ssdpyt_fp32.pt"
+    if os.path.exists(pre_ssd_path) is False:
+        raise FileNotFoundError("nvidia_ssdpyt_fp32.pt not find in {}".format(pre_ssd_path))
     pre_model_dict = torch.load(pre_ssd_path, map_location=device)
     pre_weights_dict = pre_model_dict["model"]
 
@@ -33,7 +36,7 @@ def create_model(num_classes=21, device=torch.device('cpu')):
         print("missing_keys: ", missing_keys)
         print("unexpected_keys: ", unexpected_keys)
 
-    return model
+    return model.to(device)
 
 
 def main(parser_data):
@@ -43,17 +46,19 @@ def main(parser_data):
     if not os.path.exists("save_weights"):
         os.mkdir("save_weights")
 
+    results_file = "results{}.txt".format(datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+
     data_transform = {
-        "train": transform.Compose([transform.SSDCropping(),
-                                    transform.Resize(),
-                                    transform.ColorJitter(),
-                                    transform.ToTensor(),
-                                    transform.RandomHorizontalFlip(),
-                                    transform.Normalization(),
-                                    transform.AssignGTtoDefaultBox()]),
-        "val": transform.Compose([transform.Resize(),
-                                  transform.ToTensor(),
-                                  transform.Normalization()])
+        "train": transforms.Compose([transforms.SSDCropping(),
+                                     transforms.Resize(),
+                                     transforms.ColorJitter(),
+                                     transforms.ToTensor(),
+                                     transforms.RandomHorizontalFlip(),
+                                     transforms.Normalization(),
+                                     transforms.AssignGTtoDefaultBox()]),
+        "val": transforms.Compose([transforms.Resize(),
+                                   transforms.ToTensor(),
+                                   transforms.Normalization()])
     }
 
     VOC_root = parser_data.data_path
@@ -65,13 +70,16 @@ def main(parser_data):
     # 注意训练时，batch_size必须大于1
     batch_size = parser_data.batch_size
     assert batch_size > 1, "batch size must be greater than 1"
+    # 防止最后一个batch_size=1，如果最后一个batch_size=1就舍去
+    drop_last = True if len(train_dataset) % batch_size == 1 else False
     nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
     print('Using %g dataloader workers' % nw)
     train_data_loader = torch.utils.data.DataLoader(train_dataset,
                                                     batch_size=batch_size,
                                                     shuffle=True,
                                                     num_workers=nw,
-                                                    collate_fn=train_dataset.collate_fn)
+                                                    collate_fn=train_dataset.collate_fn,
+                                                    drop_last=drop_last)
 
     val_dataset = VOC2012DataSet(VOC_root, data_transform['val'], train_set='val.txt')
     val_data_loader = torch.utils.data.DataLoader(val_dataset,
@@ -80,8 +88,7 @@ def main(parser_data):
                                                   num_workers=nw,
                                                   collate_fn=train_dataset.collate_fn)
 
-    model = create_model(num_classes=21, device=device)
-    model.to(device)
+    model = create_model(num_classes=args.num_classes+1, device=device)
 
     # define optimizer
     params = [p for p in model.parameters() if p.requires_grad]
@@ -105,20 +112,30 @@ def main(parser_data):
     learning_rate = []
     val_map = []
 
-    val_data = None
-    # 如果电脑内存充裕，可提前加载验证集数据，以免每次验证时都要重新加载一次数据，节省时间
-    # val_data = get_coco_api_from_dataset(val_data_loader.dataset)
+    # 提前加载验证集数据，以免每次验证时都要重新加载一次数据，节省时间
+    val_data = get_coco_api_from_dataset(val_data_loader.dataset)
     for epoch in range(parser_data.start_epoch, parser_data.epochs):
-        utils.train_one_epoch(model=model, optimizer=optimizer,
-                              data_loader=train_data_loader,
-                              device=device, epoch=epoch,
-                              print_freq=50, train_loss=train_loss,
-                              train_lr=learning_rate)
+        mean_loss, lr = utils.train_one_epoch(model=model, optimizer=optimizer,
+                                              data_loader=train_data_loader,
+                                              device=device, epoch=epoch,
+                                              print_freq=50)
+        train_loss.append(mean_loss.item())
+        learning_rate.append(lr)
 
+        # update learning rate
         lr_scheduler.step()
 
-        utils.evaluate(model=model, data_loader=val_data_loader,
-                       device=device, data_set=val_data, mAP_list=val_map)
+        coco_info = utils.evaluate(model=model, data_loader=val_data_loader,
+                                   device=device, data_set=val_data)
+
+        # write into txt
+        with open(results_file, "a") as f:
+            # 写入的数据包括coco指标还有loss和learning rate
+            result_info = [str(round(i, 4)) for i in coco_info + [mean_loss.item(), lr]]
+            txt = "epoch:{} {}".format(epoch, '  '.join(result_info))
+            f.write(txt + "\n")
+
+        val_map.append(coco_info[1])  # pascal mAP
 
         # save weights
         save_files = {
@@ -151,8 +168,10 @@ if __name__ == '__main__':
 
     # 训练设备类型
     parser.add_argument('--device', default='cuda:0', help='device')
-    # 训练数据集的根目录
-    parser.add_argument('--data-path', default='../', help='dataset')
+    # 检测的目标类别个数，不包括背景
+    parser.add_argument('--num_classes', default=20, type=int, help='num_classes')
+    # 训练数据集的根目录(VOCdevkit)
+    parser.add_argument('--data-path', default='./', help='dataset')
     # 文件保存地址
     parser.add_argument('--output-dir', default='./save_weights', help='path where to save')
     # 若需要接着上次训练，则指定上次训练保存权重文件地址

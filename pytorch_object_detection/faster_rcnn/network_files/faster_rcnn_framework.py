@@ -1,14 +1,15 @@
-import torch
-from torch import nn
-from collections import OrderedDict
-from network_files.rpn_function import AnchorsGenerator, RPNHead, RegionProposalNetwork
-from network_files.roi_head import RoIHeads
-from torchvision.ops import MultiScaleRoIAlign
-from torch.jit.annotations import Tuple, List, Dict, Optional
-from torch import Tensor
-import torch.nn.functional as F
 import warnings
-from network_files.transform import GeneralizedRCNNTransform
+from collections import OrderedDict
+from typing import Tuple, List, Dict, Optional, Union
+
+import torch
+from torch import nn, Tensor
+import torch.nn.functional as F
+from torchvision.ops import MultiScaleRoIAlign
+
+from .roi_head import RoIHeads
+from .transform import GeneralizedRCNNTransform
+from .rpn_function import AnchorsGenerator, RPNHead, RegionProposalNetwork
 
 
 class FasterRCNNBase(nn.Module):
@@ -35,7 +36,7 @@ class FasterRCNNBase(nn.Module):
 
     @torch.jit.unused
     def eager_outputs(self, losses, detections):
-        # type: (Dict[str, Tensor], List[Dict[str, Tensor]]) -> Tuple[Dict[str, Tensor], List[Dict[str, Tensor]]]
+        # type: (Dict[str, Tensor], List[Dict[str, Tensor]]) -> Union[Dict[str, Tensor], List[Dict[str, Tensor]]]
         if self.training:
             return losses
 
@@ -79,12 +80,15 @@ class FasterRCNNBase(nn.Module):
         # original_image_sizes = [img.shape[-2:] for img in images]
 
         images, targets = self.transform(images, targets)  # 对图像进行预处理
+
         # print(images.tensors.shape)
         features = self.backbone(images.tensors)  # 将图像输入backbone得到特征图
         if isinstance(features, torch.Tensor):  # 若只在一层特征层上预测，将feature放入有序字典中，并编号为‘0’
             features = OrderedDict([('0', features)])  # 若在多层特征层上预测，传入的就是一个有序字典
 
         # 将特征层以及标注target信息传入rpn中
+        # proposals: List[Tensor], Tensor_shape: [num_proposals, 4],
+        # 每个proposals是绝对坐标，且为(x1, y1, x2, y2)格式
         proposals, proposal_losses = self.rpn(images, features, targets)
 
         # 将rpn生成的数据以及标注target信息传入fast rcnn后半部分
@@ -216,6 +220,8 @@ class FasterRCNN(FasterRCNNBase):
             for computing the loss
         rpn_positive_fraction (float): proportion of positive anchors in a mini-batch during training
             of the RPN
+        rpn_score_thresh (float): during inference, only return proposals with a classification score
+            greater than rpn_score_thresh
         box_roi_pool (MultiScaleRoIAlign): the module which crops and resizes the feature maps in
             the locations indicated by the bounding boxes
         box_head (nn.Module): module that takes the cropped feature maps as input
@@ -240,7 +246,7 @@ class FasterRCNN(FasterRCNNBase):
 
     def __init__(self, backbone, num_classes=None,
                  # transform parameter
-                 min_size=800, max_size=1000,      # 预处理resize时限制的最小尺寸与最大尺寸
+                 min_size=800, max_size=1333,      # 预处理resize时限制的最小尺寸与最大尺寸
                  image_mean=None, image_std=None,  # 预处理normalize时使用的均值和方差
                  # RPN parameters
                  rpn_anchor_generator=None, rpn_head=None,
@@ -249,6 +255,7 @@ class FasterRCNN(FasterRCNNBase):
                  rpn_nms_thresh=0.7,  # rpn中进行nms处理时使用的iou阈值
                  rpn_fg_iou_thresh=0.7, rpn_bg_iou_thresh=0.3,  # rpn计算损失时，采集正负样本设置的阈值
                  rpn_batch_size_per_image=256, rpn_positive_fraction=0.5,  # rpn计算损失时采样的样本数，以及正样本占总样本的比例
+                 rpn_score_thresh=0.0,
                  # Box parameters
                  box_roi_pool=None, box_head=None, box_predictor=None,
                  # 移除低目标概率      fast rcnn中进行nms处理的阈值   对预测结果根据score排序取前100个目标
@@ -302,7 +309,8 @@ class FasterRCNN(FasterRCNNBase):
             rpn_anchor_generator, rpn_head,
             rpn_fg_iou_thresh, rpn_bg_iou_thresh,
             rpn_batch_size_per_image, rpn_positive_fraction,
-            rpn_pre_nms_top_n, rpn_post_nms_top_n, rpn_nms_thresh)
+            rpn_pre_nms_top_n, rpn_post_nms_top_n, rpn_nms_thresh,
+            score_thresh=rpn_score_thresh)
 
         #  Multi-scale RoIAlign pooling
         if box_roi_pool is None:
@@ -331,10 +339,10 @@ class FasterRCNN(FasterRCNNBase):
         roi_heads = RoIHeads(
             # box
             box_roi_pool, box_head, box_predictor,
-            box_fg_iou_thresh, box_bg_iou_thresh,
-            box_batch_size_per_image, box_positive_fraction,
+            box_fg_iou_thresh, box_bg_iou_thresh,  # 0.5  0.5
+            box_batch_size_per_image, box_positive_fraction,  # 512  0.25
             bbox_reg_weights,
-            box_score_thresh, box_nms_thresh, box_detections_per_img)
+            box_score_thresh, box_nms_thresh, box_detections_per_img)  # 0.05  0.5  100
 
         if image_mean is None:
             image_mean = [0.485, 0.456, 0.406]

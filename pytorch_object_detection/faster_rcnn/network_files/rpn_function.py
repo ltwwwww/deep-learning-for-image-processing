@@ -1,12 +1,13 @@
+from typing import List, Optional, Dict, Tuple
+
 import torch
-import torchvision
+from torch import nn, Tensor
 from torch.nn import functional as F
-from torch import nn
-from network_files import boxes as box_ops
-from network_files import det_utils
-from torch.jit.annotations import List, Optional, Dict, Tuple
-from torch import Tensor
-from network_files.image_list import ImageList
+import torchvision
+
+from . import det_utils
+from . import boxes as box_ops
+from .image_list import ImageList
 
 
 @torch.jit.unused
@@ -63,8 +64,8 @@ class AnchorsGenerator(nn.Module):
         self.cell_anchors = None
         self._cache = {}
 
-    def generate_anchors(self, scales, aspect_ratios, dtype=torch.float32, device="cpu"):
-        # type: (List[int], List[float], int, Device) -> Tensor
+    def generate_anchors(self, scales, aspect_ratios, dtype=torch.float32, device=torch.device("cpu")):
+        # type: (List[int], List[float], torch.dtype, torch.device) -> Tensor
         """
         compute anchor sizes
         Arguments:
@@ -90,7 +91,7 @@ class AnchorsGenerator(nn.Module):
         return base_anchors.round()  # round 四舍五入
 
     def set_cell_anchors(self, dtype, device):
-        # type: (int, Device) -> None
+        # type: (torch.dtype, torch.device) -> None
         if self.cell_anchors is not None:
             cell_anchors = self.cell_anchors
             assert cell_anchors is not None
@@ -114,7 +115,7 @@ class AnchorsGenerator(nn.Module):
     # For every combination of (a, (g, s), i) in (self.cell_anchors, zip(grid_sizes, strides), 0:2),
     # output g[i] anchors that are s[i] distance apart in direction i, with the same dimensions as a.
     def grid_anchors(self, grid_sizes, strides):
-        # type: (List[List[int]], List[List[Tensor]]) -> List(Tensor)
+        # type: (List[List[int]], List[List[Tensor]]) -> List[Tensor]
         """
         anchors position in grid coordinate axis map into origin image
         计算预测特征图对应原始图像上的所有anchors的坐标
@@ -158,7 +159,7 @@ class AnchorsGenerator(nn.Module):
         return anchors  # List[Tensor(all_num_anchors, 4)]
 
     def cached_grid_anchors(self, grid_sizes, strides):
-        # type: (List[List[int]], List[List[Tensor]]) -> List(Tensor)
+        # type: (List[List[int]], List[List[Tensor]]) -> List[Tensor]
         """将计算得到的所有anchors信息进行缓存"""
         key = str(grid_sizes) + str(strides)
         # self._cache是字典类型
@@ -169,7 +170,7 @@ class AnchorsGenerator(nn.Module):
         return anchors
 
     def forward(self, image_list, feature_maps):
-        # type: (ImageList, List[Tensor]) -> List(Tensor)
+        # type: (ImageList, List[Tensor]) -> List[Tensor]
         # 获取每个预测特征层的尺寸(height, width)
         grid_sizes = list([feature_map.shape[-2:] for feature_map in feature_maps])
 
@@ -181,8 +182,8 @@ class AnchorsGenerator(nn.Module):
 
         # one step in feature map equate n pixel stride in origin image
         # 计算特征层上的一步等于原始图像上的步长
-        strides = [[torch.tensor(image_size[0] / g[0], dtype=torch.int64, device=device),
-                    torch.tensor(image_size[1] / g[1], dtype=torch.int64, device=device)] for g in grid_sizes]
+        strides = [[torch.tensor(image_size[0] // g[0], dtype=torch.int64, device=device),
+                    torch.tensor(image_size[1] // g[1], dtype=torch.int64, device=device)] for g in grid_sizes]
 
         # 根据提供的sizes和aspect_ratios生成anchors模板
         self.set_cell_anchors(dtype, device)
@@ -232,7 +233,7 @@ class RPNHead(nn.Module):
                 torch.nn.init.constant_(layer.bias, 0)
 
     def forward(self, x):
-        # type: (List[Tensor]) -> Tuple[List[Tensor], List(Tensor)]
+        # type: (List[Tensor]) -> Tuple[List[Tensor], List[Tensor]]
         logits = []
         bbox_reg = []
         for i, feature in enumerate(x):
@@ -344,7 +345,7 @@ class RegionProposalNetwork(torch.nn.Module):
     def __init__(self, anchor_generator, head,
                  fg_iou_thresh, bg_iou_thresh,
                  batch_size_per_image, positive_fraction,
-                 pre_nms_top_n, post_nms_top_n, nms_thresh):
+                 pre_nms_top_n, post_nms_top_n, nms_thresh, score_thresh=0.0):
         super(RegionProposalNetwork, self).__init__()
         self.anchor_generator = anchor_generator
         self.head = head
@@ -368,7 +369,8 @@ class RegionProposalNetwork(torch.nn.Module):
         self._pre_nms_top_n = pre_nms_top_n
         self._post_nms_top_n = post_nms_top_n
         self.nms_thresh = nms_thresh
-        self.min_size = 1e-3
+        self.score_thresh = score_thresh
+        self.min_size = 1.
 
     def pre_nms_top_n(self):
         if self.training:
@@ -411,8 +413,14 @@ class RegionProposalNetwork(torch.nn.Module):
                 # NB: need to clamp the indices because we can have a single
                 # GT in the image, and matched_idxs can be -2, which goes
                 # out of bounds
+                # 这里使用clamp设置下限0是为了方便取每个anchors对应的gt_boxes信息
+                # 负样本和舍弃的样本都是负值，所以为了防止越界直接置为0
+                # 因为后面是通过labels_per_image变量来记录正样本位置的，
+                # 所以负样本和舍弃的样本对应的gt_boxes信息并没有什么意义，
+                # 反正计算目标边界框回归损失时只会用到正样本。
                 matched_gt_boxes_per_image = gt_boxes[matched_idxs.clamp(min=0)]
 
+                # 记录所有anchors匹配后的标签(正样本处标记为1，负样本处标记为0，丢弃样本处标记为-2)
                 labels_per_image = matched_idxs >= 0
                 labels_per_image = labels_per_image.to(dtype=torch.float32)
 
@@ -446,7 +454,7 @@ class RegionProposalNetwork(torch.nn.Module):
                 num_anchors, pre_nms_top_n = _onnx_get_num_anchors_and_pre_nms_top_n(ob, self.pre_nms_top_n())
             else:
                 num_anchors = ob.shape[1]  # 预测特征层上的预测的anchors个数
-                pre_nms_top_n = min(self.pre_nms_top_n(), num_anchors)  # self.pre_nms_top_n=1000
+                pre_nms_top_n = min(self.pre_nms_top_n(), num_anchors)
 
             # Returns the k largest elements of the given input tensor along a given dimension
             _, top_n_idx = ob.topk(pre_nms_top_n, dim=1)
@@ -496,20 +504,31 @@ class RegionProposalNetwork(torch.nn.Module):
         # 预测概率排前pre_nms_top_n的anchors索引值获取相应bbox坐标信息
         proposals = proposals[batch_idx, top_n_idx]
 
+        objectness_prob = torch.sigmoid(objectness)
+
         final_boxes = []
         final_scores = []
         # 遍历每张图像的相关预测信息
-        for boxes, scores, lvl, img_shape in zip(proposals, objectness, levels, image_shapes):
+        for boxes, scores, lvl, img_shape in zip(proposals, objectness_prob, levels, image_shapes):
             # 调整预测的boxes信息，将越界的坐标调整到图片边界上
             boxes = box_ops.clip_boxes_to_image(boxes, img_shape)
+
             # 返回boxes满足宽，高都大于min_size的索引
             keep = box_ops.remove_small_boxes(boxes, self.min_size)
             boxes, scores, lvl = boxes[keep], scores[keep], lvl[keep]
+
+            # 移除小概率boxes，参考下面这个链接
+            # https://github.com/pytorch/vision/pull/3205
+            keep = torch.where(torch.ge(scores, self.score_thresh))[0]  # ge: >=
+            boxes, scores, lvl = boxes[keep], scores[keep], lvl[keep]
+
             # non-maximum suppression, independently done per level
             keep = box_ops.batched_nms(boxes, scores, lvl, self.nms_thresh)
+
             # keep only topk scoring predictions
             keep = keep[: self.post_nms_top_n()]
             boxes, scores = boxes[keep], scores[keep]
+
             final_boxes.append(boxes)
             final_scores.append(scores)
         return final_boxes, final_scores
@@ -531,8 +550,10 @@ class RegionProposalNetwork(torch.nn.Module):
         # 按照给定的batch_size_per_image, positive_fraction选择正负样本
         sampled_pos_inds, sampled_neg_inds = self.fg_bg_sampler(labels)
         # 将一个batch中的所有正负样本List(Tensor)分别拼接在一起，并获取非零位置的索引
-        sampled_pos_inds = torch.nonzero(torch.cat(sampled_pos_inds, dim=0)).squeeze(1)
-        sampled_neg_inds = torch.nonzero(torch.cat(sampled_neg_inds, dim=0)).squeeze(1)
+        # sampled_pos_inds = torch.nonzero(torch.cat(sampled_pos_inds, dim=0)).squeeze(1)
+        sampled_pos_inds = torch.where(torch.cat(sampled_pos_inds, dim=0))[0]
+        # sampled_neg_inds = torch.nonzero(torch.cat(sampled_neg_inds, dim=0)).squeeze(1)
+        sampled_neg_inds = torch.where(torch.cat(sampled_neg_inds, dim=0))[0]
 
         # 将所有正负样本索引拼接在一起
         sampled_inds = torch.cat([sampled_pos_inds, sampled_neg_inds], dim=0)

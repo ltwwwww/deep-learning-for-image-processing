@@ -37,6 +37,12 @@ class BasicBlock(layers.Layer):
 
 
 class Bottleneck(layers.Layer):
+    """
+    注意：原论文中，在虚线残差结构的主分支上，第一个1x1卷积层的步距是2，第二个3x3卷积层步距是1。
+    但在pytorch官方实现过程中是第一个1x1卷积层的步距是1，第二个3x3卷积层步距是2，
+    这么做的好处是能够在top1上提升大概0.5%的准确率。
+    可参考Resnet v1.5 https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch
+    """
     expansion = 4
 
     def __init__(self, out_channel, strides=1, downsample=None, **kwargs):
@@ -122,8 +128,8 @@ def _resnet(block, blocks_num, im_width=224, im_height=224, num_classes=1000, in
     return model
 
 
-def resnet34(im_width=224, im_height=224, num_classes=1000):
-    return _resnet(BasicBlock, [3, 4, 6, 3], im_width, im_height, num_classes)
+def resnet34(im_width=224, im_height=224, num_classes=1000, include_top=True):
+    return _resnet(BasicBlock, [3, 4, 6, 3], im_width, im_height, num_classes, include_top)
 
 
 def resnet50(im_width=224, im_height=224, num_classes=1000, include_top=True):
